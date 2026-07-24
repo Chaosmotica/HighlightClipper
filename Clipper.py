@@ -195,39 +195,45 @@ CANDIDATES:
 """
 
 
-def enforce_length_bounds(highlights, min_len, max_len):
+def enforce_length_bounds(highlights, min_len, max_len, video_duration=None):
     """min_len/max_len are only given to the LLM as prompt instructions
-    (see RANK_PROMPT_TEMPLATE/REDUCE_PROMPT_TEMPLATE) -- it doesn't reliably
-    follow them, especially min_len, so bounds have to be enforced here
-    instead of just requested. Drop clips too short to be salvaged; clamp
-    ones that ran long down to max_len (keeping the LLM's chosen start,
-    since that's the hook)."""
+    (see RANK_PROMPT_TEMPLATE/REDUCE_PROMPT_TEMPLATE) -- in practice it
+    almost never returns a clip anywhere near min_len on its own, so bounds
+    have to be enforced here. Extend short clips out to min_len (capped at
+    video_duration, if known) rather than dropping them -- dropping instead
+    of extending emptied the entire highlight list on a real test video,
+    since every LLM-proposed clip came in under min_len. Clamp long clips
+    down to max_len. Keeps the LLM's chosen start, since that's the hook."""
     kept = []
     for h in highlights:
-        dur = h["end"] - h["start"]
-        if dur < min_len:
-            continue
-        if dur > max_len:
-            h = {**h, "end": h["start"] + max_len}
-        kept.append(h)
+        start, end = h["start"], h["end"]
+        if end - start < min_len:
+            end = start + min_len
+            if video_duration is not None:
+                end = min(end, video_duration)
+        if end - start > max_len:
+            end = start + max_len
+        if end - start < min_len:
+            continue  # only possible if video_duration cut off the extension
+        kept.append({**h, "end": end})
     return kept
 
 
-def rank_segments(segments, num_clips, min_len, max_len, model):
+def rank_segments(segments, num_clips, min_len, max_len, model, video_duration=None):
     prompt = RANK_PROMPT_TEMPLATE.format(
         num_clips=num_clips, min_len=min_len, max_len=max_len,
         transcript=format_transcript_for_llm(segments),
     )
     highlights = parse_json_array(call_ollama(prompt, model))
-    return enforce_length_bounds(highlights, min_len, max_len)
+    return enforce_length_bounds(highlights, min_len, max_len, video_duration)
 
 
-def reduce_candidates(candidates, num_clips, min_len, max_len, model):
+def reduce_candidates(candidates, num_clips, min_len, max_len, model, video_duration=None):
     prompt = REDUCE_PROMPT_TEMPLATE.format(
         num_clips=num_clips, candidates_json=json.dumps(candidates, indent=2)
     )
     highlights = parse_json_array(call_ollama(prompt, model))
-    return enforce_length_bounds(highlights, min_len, max_len)
+    return enforce_length_bounds(highlights, min_len, max_len, video_duration)
 
 
 def dedupe_overlaps(highlights, overlap_threshold=0.5):
@@ -274,7 +280,7 @@ def get_highlights(transcript, num_clips, min_len, max_len, model, chunk_minutes
         # Over-request since enforce_length_bounds (inside rank_segments) will
         # drop some candidates for being out of bounds -- without this buffer
         # a short video could come up short of num_clips after filtering.
-        highlights = rank_segments(transcript, math.ceil(num_clips * 1.3), min_len, max_len, model)
+        highlights = rank_segments(transcript, math.ceil(num_clips * 1.3), min_len, max_len, model, video_duration=duration)
     else:
         chunks = chunk_transcript(transcript, chunk_sec, overlap_sec=30)
         print(f"[2/6] Video is {duration/60:.0f} min -- ranking in {len(chunks)} chunks of ~{chunk_minutes} min...")
@@ -283,11 +289,11 @@ def get_highlights(transcript, num_clips, min_len, max_len, model, chunk_minutes
         all_candidates = []
         for idx, (cs, ce, segs) in enumerate(chunks, 1):
             print(f"    [{idx}/{len(chunks)}] ranking {cs/60:.1f}-{ce/60:.1f} min...")
-            all_candidates.extend(rank_segments(segs, per_chunk_n, min_len, max_len, model))
+            all_candidates.extend(rank_segments(segs, per_chunk_n, min_len, max_len, model, video_duration=duration))
 
         all_candidates = dedupe_overlaps(all_candidates)
         print(f"[2/6] {len(all_candidates)} candidates after per-chunk dedup. Running cross-video re-rank...")
-        highlights = reduce_candidates(all_candidates, num_clips, min_len, max_len, model)
+        highlights = reduce_candidates(all_candidates, num_clips, min_len, max_len, model, video_duration=duration)
 
     highlights = dedupe_overlaps(highlights)
     highlights = sorted(highlights, key=lambda h: h["score"], reverse=True)[:num_clips]
